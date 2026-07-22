@@ -8,7 +8,7 @@ use anyhow::Result;
 use chrono::Utc;
 use rsipstack::dialog::DialogId;
 use rsipstack::dialog::dialog::{
-    Dialog, DialogState, DialogStateReceiver, DialogStateSender, TerminatedReason,
+    DialogState, DialogStateReceiver, DialogStateSender, TerminatedReason,
 };
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::invitation::InviteOption;
