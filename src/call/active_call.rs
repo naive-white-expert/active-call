@@ -40,7 +40,9 @@ use crate::{
 use anyhow::Result;
 use audio_codec::CodecType;
 use chrono::{DateTime, Utc};
-use rsipstack::dialog::{invitation::InviteOption, server_dialog::ServerInviteDialog};
+use rsipstack::dialog::{
+    dialog::Dialog, invitation::InviteOption, server_dialog::ServerInviteDialog,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -545,6 +547,8 @@ pub struct ActiveCall {
     pub cmd_sender: CommandSender,
     pub dump_events: bool,
     pub server_side_track_id: TrackId,
+    /// Ensures SIP BYE is sent at most once (do_hangup vs Drop/cleanup races).
+    pub sip_hangup_started: AtomicBool,
 }
 
 pub struct ActiveCallGuard {
@@ -644,6 +648,7 @@ impl ActiveCall {
             cmd_sender,
             dump_events,
             server_side_track_id,
+            sip_hangup_started: AtomicBool::new(false),
         }
     }
 
@@ -1604,6 +1609,14 @@ impl ActiveCall {
                     state.set_hangup_reason(hangup_reason.clone());
                     state.refer_call_token.take()
                 };
+
+                // SIP media control order (定稿): BYE → await downstream 200 → then media teardown.
+                // Never stop media / drop dialog first (that races remove_dialog → on_remove and
+                // aborts the BYE transaction).
+                if matches!(self.call_type, ActiveCallType::Sip | ActiveCallType::B2bua) {
+                    self.send_sip_bye_then_remove(None).await;
+                }
+
                 self.media_stream
                     .stop(Some(hangup_reason.to_string()), initiator);
                 if let Some(token) = refer_token {
@@ -1613,6 +1626,147 @@ impl ActiveCall {
         }
         tokio::task::yield_now().await;
         Ok(())
+    }
+
+    /// Resolve an established SIP dialog for this session (or refer child).
+    /// Mirrors the lookup used by `do_message`.
+    async fn resolve_established_sip_dialog(&self, refer: Option<bool>) -> Option<Dialog> {
+        let dialog_key = if refer == Some(true) {
+            let refer_state = self.call_state.read().await.refer_callstate.clone();
+            match refer_state {
+                Some(state) => Some(state.read().await.session_id.clone()),
+                None => None,
+            }
+        } else {
+            Some(self.call_state.read().await.session_id.clone())
+        };
+
+        let mut dialog = dialog_key
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.invitation.dialog_layer.get_dialog_with(id));
+
+        if dialog.is_none() {
+            if let Some(target_id) = dialog_key.as_ref().filter(|id| !id.is_empty()) {
+                dialog = self
+                    .invitation
+                    .dialog_layer
+                    .all_dialog_ids()
+                    .into_iter()
+                    .filter_map(|id| self.invitation.dialog_layer.get_dialog_with(&id))
+                    .find(|dialog| dialog.id().to_string() == *target_id);
+            }
+        }
+
+        if dialog.is_none() && refer != Some(true) {
+            dialog = self
+                .invitation
+                .dialog_layer
+                .get_client_dialog_by_call_id(&self.session_id)
+                .into_iter()
+                .find(|d| {
+                    matches!(
+                        d.state(),
+                        rsipstack::dialog::dialog::DialogState::Confirmed(_, _)
+                    )
+                })
+                .map(Dialog::ClientInvite);
+        }
+
+        if dialog.is_none() && refer == Some(true) {
+            if let Some(call_id) = dialog_key.as_ref().filter(|id| !id.is_empty()) {
+                dialog = self
+                    .invitation
+                    .dialog_layer
+                    .get_client_dialog_by_call_id(call_id)
+                    .into_iter()
+                    .find(|d| {
+                        matches!(
+                            d.state(),
+                            rsipstack::dialog::dialog::DialogState::Confirmed(_, _)
+                        )
+                    })
+                    .map(Dialog::ClientInvite);
+            }
+        }
+
+        dialog
+    }
+
+    /// Build optional BYE headers from call-state extras (`_hangup_headers`).
+    fn hangup_headers_from_state(extras: &Option<HashMap<String, serde_json::Value>>) -> Option<Vec<rsipstack::rsip::Header>> {
+        let headers_map = extras
+            .as_ref()
+            .and_then(|e| e.get("_hangup_headers"))
+            .and_then(|v| serde_json::from_value::<HashMap<String, String>>(v.clone()).ok())?;
+        let headers: Vec<_> = headers_map
+            .into_iter()
+            .map(|(k, v)| rsipstack::rsip::Header::Other(k.into(), v.into()))
+            .collect();
+        if headers.is_empty() {
+            None
+        } else {
+            Some(headers)
+        }
+    }
+
+    /// Send SIP BYE (or CANCEL if early), await the transaction (downstream 200), then
+    /// remove the dialog so Drop/cleanup paths are idempotent and cannot double-send.
+    async fn send_sip_bye_then_remove(&self, refer: Option<bool>) {
+        if self
+            .sip_hangup_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            info!(
+                session_id = self.session_id,
+                "SIP hangup already started — skip duplicate BYE"
+            );
+            return;
+        }
+
+        let hangup_headers = {
+            let extras = self
+                .call_state
+                .read()
+                .await
+                .extras
+                .clone();
+            Self::hangup_headers_from_state(&extras)
+        };
+
+        let Some(dialog) = self.resolve_established_sip_dialog(refer).await else {
+            warn!(
+                session_id = self.session_id,
+                "do_hangup: no SIP dialog found to BYE"
+            );
+            return;
+        };
+
+        let dialog_id = dialog.id();
+        info!(
+            session_id = self.session_id,
+            %dialog_id,
+            "do_hangup sending SIP BYE before media teardown"
+        );
+        match dialog.hangup_with_headers(hangup_headers).await {
+            Ok(()) => {
+                info!(
+                    session_id = self.session_id,
+                    %dialog_id,
+                    "do_hangup SIP BYE completed (awaited downstream response / Terminated)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    session_id = self.session_id,
+                    %dialog_id,
+                    "do_hangup SIP BYE failed: {}",
+                    e
+                );
+            }
+        }
+        self.invitation.dialog_layer.remove_dialog(&dialog_id);
     }
 
     async fn do_refer(

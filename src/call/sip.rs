@@ -45,41 +45,41 @@ impl DialogStateReceiverGuard {
         state
     }
 
-    fn take_dialog(&mut self) -> Option<Dialog> {
-        let id = match self.dialog_id.take() {
-            Some(id) => id,
-            None => return None,
-        };
-
-        match self.dialog_layer.get_dialog(&id) {
-            Some(dialog) => {
-                info!(%id, "dialog removed on  drop");
-                self.dialog_layer.remove_dialog(&id);
-                return Some(dialog);
-            }
-            _ => {}
-        }
-        None
-    }
-
+    /// Hang up first (BYE/CANCEL + await transaction), then remove from the layer.
+    /// Removing before hangup cancels the dialog token via `on_remove` and can abort BYE.
+    /// Idempotent: if the dialog is already gone/terminated, this is a no-op.
     pub async fn drop_async(&mut self) {
-        if let Some(dialog) = self.take_dialog() {
-            if let Err(e) = dialog.hangup_with_headers(self.hangup_headers.take()).await {
-                warn!(id=%dialog.id(), "error hanging up dialog on drop: {}", e);
-            }
+        let Some(id) = self.dialog_id.take() else {
+            return;
+        };
+        let Some(dialog) = self.dialog_layer.get_dialog(&id) else {
+            info!(%id, "dialog already removed before drop (idempotent)");
+            return;
+        };
+        if let Err(e) = dialog.hangup_with_headers(self.hangup_headers.take()).await {
+            warn!(id=%id, "error hanging up dialog on drop: {}", e);
         }
+        self.dialog_layer.remove_dialog(&id);
+        info!(%id, "dialog removed after hangup on drop");
     }
 }
 
 impl Drop for DialogStateReceiverGuard {
     fn drop(&mut self) {
-        if let Some(dialog) = self.take_dialog() {
-            crate::spawn(async move {
-                if let Err(e) = dialog.hangup().await {
-                    warn!(id=%dialog.id(), "error hanging up dialog on drop: {}", e);
-                }
-            });
-        }
+        let Some(id) = self.dialog_id.take() else {
+            return;
+        };
+        let Some(dialog) = self.dialog_layer.get_dialog(&id) else {
+            return;
+        };
+        let layer = self.dialog_layer.clone();
+        let headers = self.hangup_headers.take();
+        crate::spawn(async move {
+            if let Err(e) = dialog.hangup_with_headers(headers).await {
+                warn!(id=%id, "error hanging up dialog on drop: {}", e);
+            }
+            layer.remove_dialog(&id);
+        });
     }
 }
 
@@ -569,12 +569,13 @@ impl Invitation {
         if let Some(call) = self.get_pending_call(&dialog_id) {
             call.dialog.reject(code, reason).ok();
         }
-        match self.dialog_layer.get_dialog(&dialog_id) {
-            Some(dialog) => {
-                self.dialog_layer.remove_dialog(&dialog_id);
-                dialog.hangup().await.ok();
+        // BYE/CANCEL first (await downstream response), then remove — never remove_dialog
+        // before hangup (on_remove cancels the dialog token and can abort the BYE tx).
+        if let Some(dialog) = self.dialog_layer.get_dialog(&dialog_id) {
+            if let Err(e) = dialog.hangup().await {
+                warn!(%dialog_id, "invitation.hangup failed: {}", e);
             }
-            None => {}
+            self.dialog_layer.remove_dialog(&dialog_id);
         }
         Ok(())
     }
@@ -583,12 +584,11 @@ impl Invitation {
         if let Some(call) = self.get_pending_call(&dialog_id) {
             call.dialog.reject(None, None).ok();
         }
-        match self.dialog_layer.get_dialog(&dialog_id) {
-            Some(dialog) => {
-                self.dialog_layer.remove_dialog(&dialog_id);
-                dialog.hangup().await.ok();
+        if let Some(dialog) = self.dialog_layer.get_dialog(&dialog_id) {
+            if let Err(e) = dialog.hangup().await {
+                warn!(%dialog_id, "invitation.reject hangup failed: {}", e);
             }
-            None => {}
+            self.dialog_layer.remove_dialog(&dialog_id);
         }
         Ok(())
     }
