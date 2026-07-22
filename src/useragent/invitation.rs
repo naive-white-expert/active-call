@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use rsipstack::dialog::{
     DialogId,
-    dialog::{Dialog, DialogStateReceiver},
+    dialog::DialogStateReceiver,
     server_dialog::ServerInviteDialog,
 };
 use tokio_util::sync::CancellationToken;
@@ -32,33 +32,27 @@ impl PendingDialogGuard {
         Self { id, invitation }
     }
 
-    fn take_dialog(&self) -> Option<Dialog> {
-        if let Some(pending) = self.invitation.get_pending_call(&self.id) {
-            let dialog_id = pending.dialog.id();
-            match self.invitation.dialog_layer.get_dialog(&dialog_id) {
-                Some(dialog) => {
-                    self.invitation.dialog_layer.remove_dialog(&dialog_id);
-                    return Some(dialog);
-                }
-                None => {}
-            }
-        }
-        None
-    }
+    /// Hangup first, then remove — mirrors DialogStateReceiverGuard ordering.
     pub async fn drop_async(&self) {
-        if let Some(dialog) = self.take_dialog() {
+        let _ = self.invitation.get_pending_call(&self.id);
+        if let Some(dialog) = self.invitation.dialog_layer.get_dialog(&self.id) {
+            let id = dialog.id();
             dialog.hangup().await.ok();
+            self.invitation.dialog_layer.remove_dialog(&id);
         }
     }
 }
 
 impl Drop for PendingDialogGuard {
     fn drop(&mut self) {
-        if let Some(dialog) = self.take_dialog() {
-            info!(%self.id, "removing pending dialog on drop");
-
+        let _ = self.invitation.get_pending_call(&self.id);
+        if let Some(dialog) = self.invitation.dialog_layer.get_dialog(&self.id) {
+            info!(%self.id, "hanging up pending dialog on drop");
+            let layer = self.invitation.dialog_layer.clone();
+            let id = dialog.id();
             crate::spawn(async move {
                 dialog.hangup().await.ok();
+                layer.remove_dialog(&id);
             });
         }
     }
