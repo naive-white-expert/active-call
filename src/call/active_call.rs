@@ -549,6 +549,9 @@ pub struct ActiveCall {
     pub server_side_track_id: TrackId,
     /// Ensures SIP BYE is sent at most once (do_hangup vs Drop/cleanup races).
     pub sip_hangup_started: AtomicBool,
+    /// Set only after hangup_with_headers returns (success or error) or dialog gone.
+    /// Distinguishes "BYE in flight / aborted by cancel" from "BYE finished".
+    pub sip_hangup_done: AtomicBool,
 }
 
 pub struct ActiveCallGuard {
@@ -649,6 +652,7 @@ impl ActiveCall {
             dump_events,
             server_side_track_id,
             sip_hangup_started: AtomicBool::new(false),
+            sip_hangup_done: AtomicBool::new(false),
         }
     }
 
@@ -713,6 +717,18 @@ impl ActiveCall {
                     _ = self.cancel_token.cancelled() => {
                         info!(session_id = self.session_id, "call cancelled - cleaning up resources");
                     }
+                }
+                // If /kill (or cancel) aborted do_hangup mid hangup_with_headers.await,
+                // sip_hangup_started may be true while BYE never left the wire. Retry here.
+                if matches!(self.call_type, ActiveCallType::Sip | ActiveCallType::B2bua)
+                    && !self.sip_hangup_done.load(Ordering::SeqCst)
+                {
+                    warn!(
+                        session_id = self.session_id,
+                        "serve exit without SIP hangup done — ensuring BYE before teardown"
+                    );
+                    self.sip_hangup_started.store(false, Ordering::SeqCst);
+                    self.send_sip_bye_then_remove(None).await;
                 }
                 self.cancel_token.cancel();
             }
@@ -1622,6 +1638,9 @@ impl ActiveCall {
                 if let Some(token) = refer_token {
                     token.cancel();
                 }
+                // Leave /list so callers do not /kill mid-BYE (kill cancels serve and can
+                // abort hangup_with_headers before the request hits the wire).
+                self.cancel_token.cancel();
             }
         }
         tokio::task::yield_now().await;
@@ -1713,6 +1732,13 @@ impl ActiveCall {
     /// Send SIP BYE (or CANCEL if early), await the transaction (downstream 200), then
     /// remove the dialog so Drop/cleanup paths are idempotent and cannot double-send.
     async fn send_sip_bye_then_remove(&self, refer: Option<bool>) {
+        if self.sip_hangup_done.load(Ordering::SeqCst) {
+            info!(
+                session_id = self.session_id,
+                "SIP hangup already done — skip duplicate BYE"
+            );
+            return;
+        }
         if self
             .sip_hangup_started
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1740,6 +1766,8 @@ impl ActiveCall {
                 session_id = self.session_id,
                 "do_hangup: no SIP dialog found to BYE"
             );
+            // Allow a later retry (serve-exit ensure / second hangup command).
+            self.sip_hangup_started.store(false, Ordering::SeqCst);
             return;
         };
 
@@ -1767,6 +1795,7 @@ impl ActiveCall {
             }
         }
         self.invitation.dialog_layer.remove_dialog(&dialog_id);
+        self.sip_hangup_done.store(true, Ordering::SeqCst);
     }
 
     async fn do_refer(
